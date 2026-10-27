@@ -43,6 +43,9 @@ class OverkizEntity(CoordinatorEntity[OverkizDataUpdateCoordinator]):
     @override
     def available(self) -> bool:
         """Return True if entity is available."""
+        if self.device_url in self.coordinator.unreachable_devices:
+            return False
+
         if self.device.available:
             return super().available
 

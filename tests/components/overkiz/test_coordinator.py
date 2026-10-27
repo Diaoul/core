@@ -4,7 +4,7 @@ from unittest.mock import Mock, patch
 
 from aiohttp import ClientConnectorError
 from freezegun.api import FrozenDateTimeFactory
-from pyoverkiz.enums import ExecutionState
+from pyoverkiz.enums import ExecutionState, FailureType
 from pyoverkiz.exceptions import (
     InvalidEventListenerIdError,
     MaintenanceError,
@@ -238,6 +238,182 @@ async def test_stateless_hub_skips_the_execution_poll(
     await hass.async_block_till_done()
 
     assert mock_client.fetch_events.await_count == 1
+
+
+async def test_unreachable_device_goes_unavailable(
+    hass: HomeAssistant,
+    setup_overkiz_integration: SetupOverkizIntegration,
+    mock_client: MockOverkizClient,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A command the gateway could not deliver takes the entity down.
+
+    The server answers for the device from cache, so the execution failure is
+    the only notice that it is unreachable.
+    """
+    await setup_overkiz_integration(fixture=SHUTTER.fixture)
+    assert hass.states.get(SHUTTER.entity_id).state != STATE_UNAVAILABLE
+
+    await hass.services.async_call(
+        COVER_DOMAIN,
+        SERVICE_OPEN_COVER,
+        {ATTR_ENTITY_ID: SHUTTER.entity_id},
+        blocking=True,
+    )
+    await async_deliver_events(
+        hass,
+        freezer,
+        mock_client,
+        [
+            execution_state_changed_event(
+                "exec-1",
+                ExecutionState.FAILED,
+                ExecutionState.IN_PROGRESS,
+                failure_type_code=FailureType.PEER_DOWN,
+            )
+        ],
+        update_interval=UPDATE_INTERVAL_EXECUTION,
+    )
+
+    assert hass.states.get(SHUTTER.entity_id).state == STATE_UNAVAILABLE
+
+
+async def test_completed_execution_clears_an_unreachable_device(
+    hass: HomeAssistant,
+    setup_overkiz_integration: SetupOverkizIntegration,
+    mock_client: MockOverkizClient,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Delivering a later command proves the gateway reached the device again."""
+    entry = await setup_overkiz_integration(fixture=SHUTTER.fixture)
+    coordinator = entry.runtime_data.coordinator
+    coordinator.unreachable_devices.add(SHUTTER.device_url)
+
+    await hass.services.async_call(
+        COVER_DOMAIN,
+        SERVICE_OPEN_COVER,
+        {ATTR_ENTITY_ID: SHUTTER.entity_id},
+        blocking=True,
+    )
+    await async_deliver_events(
+        hass,
+        freezer,
+        mock_client,
+        [
+            execution_state_changed_event(
+                "exec-1", ExecutionState.COMPLETED, ExecutionState.IN_PROGRESS
+            )
+        ],
+        update_interval=UPDATE_INTERVAL_EXECUTION,
+    )
+
+    assert hass.states.get(SHUTTER.entity_id).state != STATE_UNAVAILABLE
+
+
+async def test_refused_command_leaves_the_device_available(
+    hass: HomeAssistant,
+    setup_overkiz_integration: SetupOverkizIntegration,
+    mock_client: MockOverkizClient,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A refusal proves the device answered, so it stays available."""
+    await setup_overkiz_integration(fixture=SHUTTER.fixture)
+
+    await hass.services.async_call(
+        COVER_DOMAIN,
+        SERVICE_OPEN_COVER,
+        {ATTR_ENTITY_ID: SHUTTER.entity_id},
+        blocking=True,
+    )
+    await async_deliver_events(
+        hass,
+        freezer,
+        mock_client,
+        [
+            execution_state_changed_event(
+                "exec-1",
+                ExecutionState.FAILED,
+                ExecutionState.IN_PROGRESS,
+                failure_type_code=FailureType.PRIORITY_LOCK__LOCAL_USER,
+            )
+        ],
+        update_interval=UPDATE_INTERVAL_EXECUTION,
+    )
+
+    assert hass.states.get(SHUTTER.entity_id).state != STATE_UNAVAILABLE
+
+
+async def test_merged_execution_failure_blames_no_device(
+    hass: HomeAssistant,
+    setup_overkiz_integration: SetupOverkizIntegration,
+    mock_client: MockOverkizClient,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A merged execution reports one verdict for several devices.
+
+    Nothing in it says which device failed to answer, so neither is blamed.
+    """
+    await setup_overkiz_integration(fixture=SHUTTER.fixture)
+    mock_client.execute_action_group.return_value = "exec-merged"
+
+    for cover in (SHUTTER, GARAGE):
+        await hass.services.async_call(
+            COVER_DOMAIN,
+            SERVICE_OPEN_COVER,
+            {ATTR_ENTITY_ID: cover.entity_id},
+            blocking=True,
+        )
+
+    await async_deliver_events(
+        hass,
+        freezer,
+        mock_client,
+        [
+            execution_state_changed_event(
+                "exec-merged",
+                ExecutionState.FAILED,
+                ExecutionState.IN_PROGRESS,
+                failure_type_code=FailureType.PEER_DOWN,
+            )
+        ],
+        update_interval=UPDATE_INTERVAL_EXECUTION,
+    )
+
+    assert hass.states.get(SHUTTER.entity_id).state != STATE_UNAVAILABLE
+    assert hass.states.get(GARAGE.entity_id).state != STATE_UNAVAILABLE
+
+
+async def test_rts_device_stays_available_when_a_command_fails(
+    hass: HomeAssistant,
+    setup_overkiz_integration: SetupOverkizIntegration,
+    mock_client: MockOverkizClient,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A one-way protocol cannot acknowledge, so a failure proves nothing."""
+    await setup_overkiz_integration(fixture=RTS_SHUTTER.fixture)
+
+    await hass.services.async_call(
+        COVER_DOMAIN,
+        SERVICE_OPEN_COVER,
+        {ATTR_ENTITY_ID: RTS_SHUTTER.entity_id},
+        blocking=True,
+    )
+    await async_deliver_events(
+        hass,
+        freezer,
+        mock_client,
+        [
+            execution_state_changed_event(
+                "exec-1",
+                ExecutionState.FAILED,
+                ExecutionState.IN_PROGRESS,
+                failure_type_code=FailureType.PEER_DOWN,
+            )
+        ],
+        update_interval=UPDATE_INTERVAL_ALL_ASSUMED_STATE,
+    )
+
+    assert hass.states.get(RTS_SHUTTER.entity_id).state != STATE_UNAVAILABLE
 
 
 async def test_device_removed_deletes_device(

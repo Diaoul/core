@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, override
 
 from aiohttp import ClientConnectorError, ServerDisconnectedError
 from pyoverkiz.client import OverkizClient
-from pyoverkiz.enums import EventName, ExecutionState, Protocol
+from pyoverkiz.enums import EventName, ExecutionState, FailureType, Protocol
 from pyoverkiz.exceptions import (
     BadCredentialsError,
     InvalidEventListenerIdError,
@@ -51,6 +51,19 @@ from .const import (
     UPDATE_INTERVAL,
     UPDATE_INTERVAL_EXECUTION,
 )
+
+# A command can fail because the device refused it (a priority lock, an open
+# door) or because the gateway never reached it. Only the latter says anything
+# about availability.
+UNREACHABLE_FAILURE_TYPES = {
+    FailureType.ACTUATORNOANSWER,
+    FailureType.ACTUATORUNKNOWN,
+    FailureType.ADDRESS_UNKNOWN,
+    FailureType.PEER_DOWN,
+    FailureType.TIME_OUT_ON_COMMAND_PROGRESS,
+    FailureType.TIME_OUT_ON_TRANSMIT,
+    FailureType.TIME_OUT_ON_TRANSMITTED_COMMAND,
+}
 
 # Events are a discriminated union; each handler narrows to its own subtype.
 EVENT_HANDLERS: Registry[
@@ -95,6 +108,9 @@ class OverkizDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Device]]):
         self.client = client
         self.devices: dict[str, Device] = {d.device_url: d for d in devices}
         self.executions: dict[str, set[OverkizDeviceCommand]] = {}
+        # The server keeps answering for a device its gateway cannot reach, so
+        # a failed execution is the only notice of it.
+        self.unreachable_devices: set[str] = set()
         self.areas = self._places_to_area(places) if places else None
         self._default_update_interval = UPDATE_INTERVAL
 
@@ -281,8 +297,34 @@ async def on_execution_state_changed(
     coordinator: OverkizDataUpdateCoordinator, event: ExecutionStateChangedEvent
 ) -> None:
     """Handle execution changed event."""
-    if event.exec_id in coordinator.executions and event.new_state in [
+    if event.exec_id not in coordinator.executions or event.new_state not in [
         ExecutionState.COMPLETED,
         ExecutionState.FAILED,
     ]:
-        del coordinator.executions[event.exec_id]
+        return
+
+    device_urls = {
+        command.device_url for command in coordinator.executions.pop(event.exec_id)
+    }
+
+    # Completion is the only verdict that proves the gateway reached every
+    # device in the execution, so it is the only one that clears them.
+    if event.new_state is ExecutionState.COMPLETED:
+        coordinator.unreachable_devices.difference_update(device_urls)
+        return
+
+    # The action queue merges concurrent action groups under one exec_id and
+    # the reported failure is execution-wide, so nothing says which device
+    # failed to answer.
+    if len(device_urls) > 1:
+        return
+
+    if event.failure_type_code not in UNREACHABLE_FAILURE_TYPES:
+        return
+
+    for device_url in device_urls:
+        # A one-way protocol cannot acknowledge, so a failure proves nothing.
+        if (device := coordinator.devices.get(device_url)) and (
+            device.identifier.protocol is not Protocol.RTS
+        ):
+            coordinator.unreachable_devices.add(device_url)
